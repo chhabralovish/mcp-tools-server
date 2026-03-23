@@ -1,155 +1,180 @@
 import asyncio
-import json
+import os
+import sys
+import threading
+from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.tools import StructuredTool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-import os
-from dotenv import load_dotenv
+from langgraph.prebuilt import create_react_agent
+from pydantic import create_model
 
 load_dotenv()
 
-
-# ── System Prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are AgentX, a smart AI assistant connected to an MCP (Model Context Protocol) server.
-
-You have access to tools exposed by the MCP server:
-- get_weather: Get current weather for any city
-- web_search: Search the web for real-time information
-- wiki_search: Search Wikipedia for factual knowledge
-- summarise_text: Summarise any long text into bullet points
-
+SYSTEM_PROMPT = """You are AgentX, a smart AI assistant connected to an MCP server.
+You have access to tools: get_weather, web_search, wiki_search, summarise_text.
 Always use the right tool for the job. Be concise, accurate and helpful.
 If a tool fails, let the user know and try an alternative approach.
 """
 
 
 class MCPClient:
-    """Client that connects to MCP server and exposes tools to LangChain agent."""
-
     def __init__(self, groq_api_key: str):
         self.groq_api_key = groq_api_key
-        self.tools = []
-        self.agent_executor = None
+        self._agent = None
+        self._loop = None
+        self._thread = None
+        self._ready = threading.Event()
+        self._error = None
 
-    async def connect_and_build(self):
-        """Connect to MCP server, discover tools, build LangChain agent."""
+    def start(self):
+        """Start MCP session in background thread and wait until ready."""
+        self._thread = threading.Thread(target=self._run_forever, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=30)
+        if self._error:
+            raise self._error
+
+    def _run_forever(self):
+        """Run async event loop forever in background thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._connect_and_stay())
+        except Exception as e:
+            self._error = e
+            self._ready.set()
+
+    async def _connect_and_stay(self):
+        """Connect to MCP server and keep session alive."""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        venv_python = os.path.join(base_dir, ".venv", "Scripts", "python.exe")
+        server_path = os.path.join(base_dir, "server.py")
+
+        if not os.path.exists(venv_python):
+            venv_python = sys.executable
+
         server_params = StdioServerParameters(
-            command="python",
-            args=["server.py"],
+            command=venv_python,
+            args=[server_path],
             env=dict(os.environ)
         )
 
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
-                # Initialise connection
                 await session.initialize()
-                print("✅ Connected to MCP server")
+                print("Connected to MCP server!")
 
-                # Discover available tools
                 tools_response = await session.list_tools()
-                print(f"🔧 Discovered {len(tools_response.tools)} tools:")
+                print(f"Found {len(tools_response.tools)} tools:")
                 for t in tools_response.tools:
-                    print(f"   - {t.name}: {t.description}")
+                    print(f"  - {t.name}")
 
-                # Convert MCP tools to LangChain tools
-                lc_tools = []
-                for mcp_tool in tools_response.tools:
-                    tool = self._mcp_to_langchain_tool(session, mcp_tool)
-                    lc_tools.append(tool)
+                # Build LangChain tools that call MCP via this session
+                lc_tools = self._build_lc_tools(session, tools_response.tools)
 
-                # Build LangChain agent with discovered tools
-                self.agent_executor = self._build_agent(lc_tools)
-                return self.agent_executor
+                # Build agent
+                self._agent = self._build_agent(lc_tools)
+                print("Agent ready!")
 
-    def _mcp_to_langchain_tool(self, session, mcp_tool) -> StructuredTool:
-        """Convert an MCP tool definition to a LangChain StructuredTool."""
-        tool_name = mcp_tool.name
+                # Signal ready
+                self._ready.set()
 
-        async def tool_func(**kwargs):
-            result = await session.call_tool(tool_name, kwargs)
-            return result.content[0].text if result.content else "No result"
+                # Keep session alive forever (until app closes)
+                await asyncio.Event().wait()
 
-        def sync_tool_func(**kwargs):
-            return asyncio.get_event_loop().run_until_complete(tool_func(**kwargs))
+    def _build_lc_tools(self, session, mcp_tools):
+        """Convert MCP tools to LangChain tools using the live session."""
+        lc_tools = []
+        for mcp_tool in mcp_tools:
+            props = mcp_tool.inputSchema.get("properties", {}) if mcp_tool.inputSchema else {}
+            fields = {k: (str, ...) for k in props} if props else {}
+            schema = create_model(f"{mcp_tool.name}_schema", **fields) if fields else None
 
-        # Build args schema from MCP inputSchema
-        props = mcp_tool.inputSchema.get("properties", {})
-        required = mcp_tool.inputSchema.get("required", [])
+            tool_name = mcp_tool.name
 
-        from pydantic import create_model
-        field_definitions = {}
-        for prop_name, prop_def in props.items():
-            field_definitions[prop_name] = (str, ...)
+            # Call MCP tool via the persistent session
+            def make_tool_func(name):
+                def func(**kwargs):
+                    # Submit to background event loop and wait for result
+                    future = asyncio.run_coroutine_threadsafe(
+                        session.call_tool(name, kwargs),
+                        self._loop
+                    )
+                    result = future.result(timeout=30)
+                    return result.content[0].text if result.content else "No result"
+                return func
 
-        schema = create_model(f"{tool_name}_schema", **field_definitions)
+            tool_kwargs = dict(
+                name=mcp_tool.name,
+                description=mcp_tool.description or f"Tool: {mcp_tool.name}",
+                func=make_tool_func(tool_name)
+            )
+            if schema:
+                tool_kwargs["args_schema"] = schema
 
-        return StructuredTool(
-            name=tool_name,
-            description=mcp_tool.description,
-            func=sync_tool_func,
-            args_schema=schema
-        )
+            lc_tools.append(StructuredTool(**tool_kwargs))
 
-    def _build_agent(self, tools) -> AgentExecutor:
-        """Build LangChain agent with MCP tools."""
+        return lc_tools
+
+    def _build_agent(self, tools):
+        """Build LangGraph react agent."""
         llm = ChatGroq(
             model="llama-3.3-70b-versatile",
             temperature=0,
             groq_api_key=self.groq_api_key
         )
+        return create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
+    def run_agent(self, question: str, chat_history: list) -> str:
+        """Run the agent synchronously."""
+        messages = []
+        for msg in chat_history:
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            else:
+                messages.append(AIMessage(content=msg["content"]))
+        messages.append(HumanMessage(content=question))
 
-        agent = create_tool_calling_agent(llm, tools, prompt)
-        return AgentExecutor(
-            agent=agent,
-            tools=tools,
-            verbose=True,
-            max_iterations=5,
-            handle_parsing_errors=True
-        )
+        result = self._agent.invoke({"messages": messages})
+        return result["messages"][-1].content
 
 
-# ── Standalone Test ───────────────────────────────────────────────────────────
-async def test_client():
-    """Test the MCP client directly from terminal."""
+def run_agent(agent_or_client, question: str, chat_history: list) -> str:
+    """Wrapper for Streamlit app compatibility."""
+    if isinstance(agent_or_client, MCPClient):
+        return agent_or_client.run_agent(question, chat_history)
+    # fallback for direct agent
+    messages = [HumanMessage(content=msg["content"]) if msg["role"] == "user"
+                else AIMessage(content=msg["content"]) for msg in chat_history]
+    messages.append(HumanMessage(content=question))
+    result = agent_or_client.invoke({"messages": messages})
+    return result["messages"][-1].content
+
+
+# ── Standalone terminal test ──────────────────────────────────────────────────
+if __name__ == "__main__":
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
-        print("❌ GROQ_API_KEY not found in .env")
-        return
+        print("GROQ_API_KEY not found in .env")
+        exit(1)
 
     client = MCPClient(groq_key)
-    agent = await client.connect_and_build()
+    print("Starting MCP client...")
+    client.start()
 
-    print("\n🤖 AgentX MCP Client ready! Type your questions (or 'exit' to quit)\n")
+    print("\nAgentX MCP Client ready! (type exit to quit)\n")
     history = []
-
     while True:
         question = input("You: ").strip()
         if question.lower() in ["exit", "quit"]:
             break
         if not question:
             continue
-
-        result = agent.invoke({
-            "input": question,
-            "chat_history": history
-        })
-        answer = result["output"]
-        print(f"\nAgentX: {answer}\n")
-
-        history.append(HumanMessage(content=question))
-        history.append(AIMessage(content=answer))
-
-
-if __name__ == "__main__":
-    asyncio.run(test_client())
+        response = client.run_agent(question, history)
+        print(f"\nAgentX: {response}\n")
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": response})

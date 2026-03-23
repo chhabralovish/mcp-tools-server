@@ -1,11 +1,43 @@
 import streamlit as st
 import asyncio
 import os
+import threading
 from dotenv import load_dotenv
 from client import MCPClient
 from langchain_core.messages import HumanMessage, AIMessage
 
 load_dotenv()
+
+# ── Page Config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="AgentX — MCP Powered",
+    page_icon="🔌",
+    layout="centered"
+)
+
+
+def run_async_in_thread(coro):
+    """Run async coroutine in a separate thread with its own event loop."""
+    result = {"value": None, "error": None}
+
+    def thread_target():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result["value"] = loop.run_until_complete(coro)
+        except Exception as e:
+            import traceback
+            result["error"] = traceback.format_exc()
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=thread_target)
+    thread.start()
+    thread.join()
+
+    if result["error"]:
+        raise Exception(result["error"])
+    return result["value"]
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -78,8 +110,8 @@ if groq_api_key:
             try:
                 os.environ["GROQ_API_KEY"] = groq_api_key
                 client = MCPClient(groq_api_key)
-                agent = asyncio.run(client.connect_and_build())
-                st.session_state["mcp_agent"] = agent
+                client.start()
+                st.session_state["mcp_agent"] = client
                 st.session_state["mcp_key"] = groq_api_key
                 st.session_state["messages"] = []
                 st.success("✅ Connected to MCP server! Agent ready.")
@@ -106,18 +138,12 @@ if prompt := st.chat_input("Ask AgentX (MCP Edition) anything..."):
     with st.chat_message("assistant"):
         with st.spinner("🔌 MCP Agent thinking and calling tools..."):
             try:
-                history = []
-                for msg in st.session_state["messages"][:-1]:
-                    if msg["role"] == "user":
-                        history.append(HumanMessage(content=msg["content"]))
-                    else:
-                        history.append(AIMessage(content=msg["content"]))
-
-                result = st.session_state["mcp_agent"].invoke({
-                    "input": prompt,
-                    "chat_history": history
-                })
-                response = result["output"]
+                from client import run_agent
+                response = run_agent(
+                    st.session_state["mcp_agent"],
+                    prompt,
+                    st.session_state["messages"][:-1]
+                )
                 st.markdown(response)
                 st.session_state["messages"].append({
                     "role": "assistant",
